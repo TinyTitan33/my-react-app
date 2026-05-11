@@ -16,6 +16,8 @@ const UI_TEXT = {
   loading: { en: "Loading Campaign...", fi: "Ladataan kampanjaa..." },
   submitting: { en: "Submitting...", fi: "Lähetetään..." },
   error: { en: "Error loading campaign data.", fi: "Virhe ladattaessa kampanjatietoja." },
+  not_found_title: { en: "Campaign Not Found", fi: "Kampanjaa ei löydy" },
+  not_found_msg: { en: "The campaign you are looking for, does not exist or is no longer available.", fi: "Etsimääsi kampanjaa ei ole olemassa tai se ei ole enää saatavilla." },
   yes: { en: "Yes", fi: "Kyllä" },
   no: { en: "No", fi: "Ei" },
   first_name: { en: "First Name", fi: "Etunimi" },
@@ -74,7 +76,7 @@ function AppContent() {
       
       setLoading(true);
       try {
-        const endpoint = `http://10.150.0.101:5678/webhook/get-campaign?campaignId=${campaignId}`;
+        const endpoint = `/api/webhook/get-campaign?campaignId=${campaignId}`;
         
         const response = await fetch(endpoint);
         if (!response.ok) {
@@ -113,6 +115,8 @@ function AppContent() {
     setFinalPayload(null);
     localStorage.removeItem("campaignDbId"); // Clear the saved ID
     navigate("/");
+    // Force a reload to clear out the bad state and let the user start fresh
+    window.location.reload(); 
   };
 
   const handleFinalSubmit = async (lastPageData) => {
@@ -123,7 +127,7 @@ function AppContent() {
     const productId = selectedProduct.db_id || null;
 
     const payload = {
-      campaign_db_id: Number(campaignDbId),  // Force this to be a number
+      campaign_db_id: campaignDbId,
       first_name: completeData.first_name,
       last_name: completeData.last_name,
       email: completeData.email,
@@ -185,50 +189,94 @@ function AppContent() {
     
     setFinalPayload(payload); 
 
-    // --- API POST CALL ---
     try {
-      const POST_ENDPOINT = "/api/webhook/submit-form";
-
-      const response = await fetch(POST_ENDPOINT, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (!response.ok) {
-        // Read the actual error text from the backend so we aren't guessing
-        const errorText = await response.text();
-        throw new Error(`400 Bad Request - Backend says: ${errorText}`);
-      }
-
-      // Read JSON to get the ID for linking
-      const resultData = await response.json();
-      const submissionId = resultData?.id_submission;
-
-      // Gather up all files across all steps
+      // --- 1. UPLOAD FILES TO MINIO FIRST ---
+      const allFilesToUpload = [];
       const uploadedFiles = [];
+
       dynamicPages.forEach(page => {
         page.fields.filter(f => f.type === "fileUpload").forEach(f => {
           const key = `p${page.order_page}_f${f.order_field}`;
-          const urls = completeData[key];
-          if (Array.isArray(urls)) {
-            urls.forEach(url => uploadedFiles.push({ url }));
+          const fileItems = completeData[key];
+          
+          if (Array.isArray(fileItems)) {
+            fileItems.forEach(item => {
+              if (item instanceof File) {
+                allFilesToUpload.push(item);
+              }
+            });
           }
         });
       });
 
-      // Fire off the separate API call to link files to this submission
+      if (allFilesToUpload.length > 0) {
+        const uploadUrl = import.meta.env.VITE_MINIO_UPLOAD_URL || 'http://localhost:3000/upload';
+        const uploadFormData = new FormData();
+        allFilesToUpload.forEach(file => uploadFormData.append('images', file));
+
+        const uploadResponse = await fetch(uploadUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${completeData.minioToken}` 
+          },
+          body: uploadFormData
+        });
+
+        if (!uploadResponse.ok) throw new Error("Failed to upload files to MinIO.");
+        const uploadData = await uploadResponse.json();
+
+        if (uploadData.success && uploadData.files && uploadData.files.length > 0) {
+          uploadData.files.forEach(f => {
+              const urlString = f.dbPath || f.url || f.name || "";
+              if (urlString) {
+                  const filename = urlString.split('/').pop();
+                  uploadedFiles.push({ url: `submissions/${filename}` });
+              }
+          });
+        } else {
+          throw new Error(uploadData.message || "Upload failed.");
+        }
+      }
+
+      // --- 2. SUBMIT MAIN FORM DATA ---
+      const POST_ENDPOINT = "/api/webhook/ssubmit-form";
+      const response = await fetch(POST_ENDPOINT, {
+        method: "POST",
+        headers: { 
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${completeData.submToken}`
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`400 Bad Request - Backend says: ${errorText}`);
+      }
+
+      const resultData = await response.json();
+      const submissionId = resultData?.id_submission;
+
+      // --- 3. LINK UPLOADED FILES TO SUBMISSION ---
       if (uploadedFiles.length > 0 && submissionId) {
+        console.log("Sending these files to the database:", uploadedFiles);
+        
         const fileLinkPayload = {
-          id_submission: submissionId,
+          id_submission: Number(submissionId),
           files: uploadedFiles
         };
 
-        await fetch("/api/webhook/link-files", { 
+        const linkResponse = await fetch("/api/webhook/files-link-upload", { 
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(fileLinkPayload)
         });
+
+        if (!linkResponse.ok) {
+           const errorText = await linkResponse.text();
+           console.error("Link-files failed! Backend says:", errorText);
+           alert(`File linking failed: ${errorText}`);
+        }
       }
 
       await new Promise(resolve => setTimeout(resolve, 800));
@@ -237,7 +285,12 @@ function AppContent() {
       setIsSubmitted(true);
     } catch (error) {
       console.error("Submission Error:", error);
-      alert(`Submission failed: ${error.message}`);
+      
+      if (error.message.includes("Duplicate entry") || error.message.includes("uq_submissions_campaign_customer")) {
+          alert("You have already submitted a response for this campaign using this email address!");
+      } else {
+          alert(`Submission failed: ${error.message}`);
+      }
     } finally {
       setIsSubmitting(false);
     }
@@ -283,8 +336,8 @@ function AppContent() {
           return opt ? opt.label[lang] : v;
         }).join(", ");
       } else {
-        // Fallback for arrays (like our new file URLs)
-        displayValue = value.map(v => typeof v === 'string' ? v.split('/').pop() : v).join(", ");
+        // Updated to safely handle File objects in the array
+        displayValue = value.map(v => v instanceof File ? v.name : (typeof v === 'string' ? v.split('/').pop() : v)).join(", ");
       }
     } else if (fieldObj?.options) {
       const opt = fieldObj.options.find(o => o.value === value);
@@ -322,10 +375,35 @@ function AppContent() {
     );
   }
 
+  // --- NEW STYLED NOT FOUND / ERROR PAGE ---
   if (!b2fData) {
     return (
       <div className="app-container">
-        <div className="form-content">{UI_TEXT.error[lang]}</div>
+        <header className="app-header">
+          <div className="lang-toggle">
+            <button className={lang === "en" ? "active" : ""} onClick={() => setLang("en")}>EN</button>
+            <button className={lang === "fi" ? "active" : ""} onClick={() => setLang("fi")}>FI</button>
+          </div>
+        </header>
+
+        <div className="form-content" style={{ textAlign: "center", padding: "50px 20px" }}>
+          <div className="animated-detective" style={{ fontSize: "4rem", marginBottom: "20px" }}>
+            🕵️‍♂️
+          </div>
+          <h2 style={{ color: "var(--text-main)", marginBottom: "15px" }}>
+            {UI_TEXT.not_found_title[lang]}
+          </h2>
+          <p style={{ color: "var(--text-muted)", fontSize: "1.1rem", marginBottom: "30px" }}>
+            {UI_TEXT.not_found_msg[lang]}
+          </p>
+          <button 
+            onClick={handleRestart} 
+            className="next-button" 
+            style={{ padding: "10px 30px" }}
+          >
+            {UI_TEXT.restart[lang]}
+          </button>
+        </div>
       </div>
     );
   }
@@ -333,7 +411,6 @@ function AppContent() {
   if (isSubmitted) {
     return (
       <div className="app-container">
-        {/* --- INJECTED HEADER INTO SUCCESS SCREEN --- */}
         <header className="app-header">
           <div className="lang-toggle">
             <button className={lang === "en" ? "active" : ""} onClick={() => setLang("en")}>EN</button>

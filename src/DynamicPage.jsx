@@ -16,7 +16,15 @@ const UI_LABELS = {
   first_name: { en: "First Name", fi: "Etunimi" },
   last_name: { en: "Last Name", fi: "Sukunimi" },
   email: { en: "Email Address", fi: "Sähköpostiosoite" },
-  product: { en: "Product", fi: "Tuote" }
+  product: { en: "Product", fi: "Tuote" },
+  privacy_info: { 
+    en: "I agree to the storage and processing of my personal data.", 
+    fi: "Hyväksyn henkilötietojeni tallentamisen ja käsittelyn." 
+  },
+  privacy_required: {
+    en: "You must agree to the data storage policy to submit.",
+    fi: "Sinun on hyväksyttävä tietosuojakäytäntö lähettääksesi lomakkeen."
+  }
 };
 
 function DynamicPage({ 
@@ -35,8 +43,10 @@ function DynamicPage({
   const navigate = useNavigate();
   const [form, setForm] = useState({});
   const [errors, setErrors] = useState({});
-  // Track uploading state to prevent premature submission
-  const [uploadingFields, setUploadingFields] = useState({});
+  
+  // Track mandatory privacy checkbox on the last page
+  const [privacyAccepted, setPrivacyAccepted] = useState(false);
+  const [privacyError, setPrivacyError] = useState(false);
 
   const sortedFields = [...pageData.fields].sort((a, b) => a.order_field - b.order_field);
   const getFieldKey = (field) => `p${pageData.order_page}_f${field.order_field}`;
@@ -85,8 +95,19 @@ function DynamicPage({
         }
       }
     });
+    
+    let isValid = Object.keys(newErrors).length === 0;
+
+    // Validate the privacy checkbox if we are on the last page
+    if (isLastPage && !privacyAccepted) {
+      setPrivacyError(true);
+      isValid = false;
+    } else {
+      setPrivacyError(false);
+    }
+
     setErrors(newErrors);
-    return Object.keys(newErrors).length === 0;
+    return isValid;
   };
 
   const getFieldStatusClass = (field, val, hasError) => {
@@ -213,58 +234,26 @@ function DynamicPage({
               type="file" 
               multiple 
               style={{ color: 'var(--text-main)' }} 
-              onChange={async (e) => {
-                // 1. Grab the target IMMEDIATELY before doing any async work
+              onChange={(e) => {
                 const inputTarget = e.target; 
                 const files = Array.from(inputTarget.files);
                 if (!files.length) return;
 
-                setUploadingFields(prev => ({ ...prev, [key]: true }));
-
-                const formData = new FormData();
-                files.forEach(file => formData.append('images', file));
-
-                try {
-                  const response = await fetch('http://localhost:3000/upload', {
-                    method: 'POST',
-                    body: formData
-                  });
-                  
-                  const data = await response.json();
-                  
-                  // 2. Extra safety checks on the response data
-                  if (data.success && data.files && data.files.length > 0) {
-                    const existingUrls = Array.isArray(val) ? val : [];
-                    // Fallback to a safe string if f.url is somehow missing
-                    const newUrls = data.files.map(f => f.url || f.name || "unknown-file");
-                    handleChange(key, [...existingUrls, ...newUrls]);
-                  } else {
-                    setErrors(prev => ({ ...prev, [key]: data.message || "Upload failed" }));
-                  }
-                } catch (error) {
-                  console.error('Upload error:', error);
-                  setErrors(prev => ({ ...prev, [key]: "Server connection error" }));
-                } finally {
-                  setUploadingFields(prev => ({ ...prev, [key]: false }));
-                  // 3. Use the safely stored reference to clear the input
-                  inputTarget.value = null; 
-                }
+                const existingFiles = Array.isArray(val) ? val : [];
+                handleChange(key, [...existingFiles, ...files]);
+                
+                inputTarget.value = null; 
               }} 
             />
             
-            {uploadingFields[key] && (
-              <span style={{ fontSize: '0.85rem', color: 'var(--primary-color)' }}>
-                Uploading files...
-              </span>
-            )}
-            
-            {Array.isArray(val) && val.length > 0 && !uploadingFields[key] && (
+            {Array.isArray(val) && val.length > 0 && (
               <div style={{ fontSize: '0.85rem', color: '#4caf50', marginTop: '4px' }}>
-                <div style={{ marginBottom: '4px', fontWeight: 'bold' }}>✓ Successfully uploaded:</div>
+                <div style={{ marginBottom: '4px', fontWeight: 'bold' }}>Attached files (will upload on submit):</div>
                 <ul style={{ margin: 0, paddingLeft: '20px' }}>
-                  {val.map((url, i) => (
-                    // 4. Safe split in case url isn't a standard string
-                    <li key={i}>{typeof url === 'string' ? url.split('/').pop() : 'Attached file'}</li>
+                  {val.map((file, i) => (
+                    <li key={i}>
+                      {file instanceof File ? file.name : (typeof file === 'string' ? file.split('/').pop() : 'Attached file')}
+                    </li>
                   ))}
                 </ul>
               </div>
@@ -275,14 +264,11 @@ function DynamicPage({
     }
   };
 
-  // Prevent moving to the next page if any file is currently uploading
-  const isCurrentlyUploading = Object.values(uploadingFields).some(status => status);
-
   return (
     <div className="form-container">
       
       {isLastPage && (
-        <div style={{ marginBottom: "35px" }}>
+        <div style={{ marginBottom: "25px" }}>
           <div className="review-header-container">
             <div className="review-header-text">
               <h2>{UI_LABELS.confirm_title[lang]}</h2>
@@ -347,13 +333,45 @@ function DynamicPage({
             {field.helpText && <small className="help-text" style={{ marginBottom: "5px", display: "block" }}>{field.helpText[lang]}</small>}
             {renderField(field)}
             {errors[key] && (
-  <p className="error-text">
-    {UI_LABELS[errors[key]] ? UI_LABELS[errors[key]][lang] : errors[key]}
-  </p>
-)}
+              <p className="error-text">
+                {UI_LABELS[errors[key]] ? UI_LABELS[errors[key]][lang] : errors[key]}
+              </p>
+            )}
           </div>
         );
       })}
+
+      {/* Mandatory Privacy Checkbox for the final page */}
+      {isLastPage && (
+        <div className="field-group" style={{ 
+          marginTop: "20px", 
+          marginBottom: "15px", 
+          padding: "15px", 
+          backgroundColor: "var(--bg-input)", 
+          borderRadius: "8px", 
+          border: privacyError ? "2px solid #ff6b6b" : "1px solid var(--border-light)" 
+        }}>
+          <label style={{ display: "flex", alignItems: "flex-start", gap: "12px", cursor: 'pointer', margin: 0 }}>
+            <input 
+              type="checkbox" 
+              checked={privacyAccepted}
+              onChange={(e) => {
+                setPrivacyAccepted(e.target.checked);
+                if (e.target.checked) setPrivacyError(false);
+              }} 
+              style={{ width: '20px', height: '20px', marginTop: '2px', flexShrink: 0 }} 
+            />
+            <span style={{ color: 'var(--text-main)', fontSize: "0.9rem", lineHeight: "1.4" }}>
+              {UI_LABELS.privacy_info[lang]} <span style={{ color: "#ff6b6b" }}>*</span>
+            </span>
+          </label>
+          {privacyError && (
+            <p className="error-text" style={{ marginTop: "8px", marginLeft: "32px" }}>
+              {UI_LABELS.privacy_required[lang]}
+            </p>
+          )}
+        </div>
+      )}
 
       <div className="nav-buttons">
         <button onClick={() => navigate(prevPath)} disabled={!prevPath} className="back-button">
@@ -363,8 +381,6 @@ function DynamicPage({
         <button 
           onClick={() => validate() && (onUpdate(form), isLastPage ? onSubmit(form) : navigate(nextPath))} 
           className="next-button"
-          disabled={isCurrentlyUploading}
-          style={{ opacity: isCurrentlyUploading ? 0.5 : 1 }}
         >
           {isLastPage ? UI_LABELS.submit[lang] : UI_LABELS.next[lang]}
         </button>

@@ -19,7 +19,8 @@ const STATIC_UI = {
   verified_success: { en: "✓ Email Verified", fi: "✓ Sähköposti vahvistettu" },
   resend: { en: "Resend", fi: "Lähetä uudelleen" },
   email_unverified: { en: "Please verify your email to continue", fi: "Vahvista sähköpostiosoitteesi jatkaaksesi" },
-  incorrect_code: { en: "Incorrect code", fi: "Virheellinen koodi" }
+  incorrect_code: { en: "Incorrect code", fi: "Virheellinen koodi" },
+  duplicate_email: { en: "You have already submitted this form for this campaign!", fi: "Olet jo lähettänyt vastauksen tähän kampanjaan tällä sähköpostiosoitteella!" }
 };
 
 export default function StaticPage({ products, lang, onUpdate, existingData, nextPath, campaign_db_id }) {
@@ -29,14 +30,14 @@ export default function StaticPage({ products, lang, onUpdate, existingData, nex
     first_name: "",
     last_name: "",
     email: "",
-    product: "" ,
-    email_verified: false 
+    product: "",
+    email_verified: false,
+    submToken: "" 
   });
   
   const [errors, setErrors] = useState({});
 
   const [verificationStatus, setVerificationStatus] = useState("idle"); 
-  const [expectedCode, setExpectedCode] = useState("");
   const [code, setCode] = useState(new Array(6).fill(""));
   const inputRefs = useRef([]);
 
@@ -51,9 +52,10 @@ export default function StaticPage({ products, lang, onUpdate, existingData, nex
         first_name: existingData.first_name || "",
         last_name: existingData.last_name || "",
         email: existingData.email || "",
-        product: existingData.product || ""
+        product: existingData.product || "",
+        submToken: existingData.submToken || ""
       }));
-      if (existingData.email) setVerificationStatus("verified");
+      if (existingData.email_verified) setVerificationStatus("verified");
     }
   }, [existingData]);
 
@@ -66,11 +68,10 @@ export default function StaticPage({ products, lang, onUpdate, existingData, nex
       // Reset verification state completely when the email value changes
       if (verificationStatus !== "idle") {
         setVerificationStatus("idle");
-        setExpectedCode("");
         setCode(new Array(6).fill(""));
         setErrorMessage("");
         setSuccessMessage("");
-        setFormData(prev => ({ ...prev, email_verified: false }));
+        setFormData(prev => ({ ...prev, email_verified: false, submToken: "" }));
       }
     }
   };
@@ -82,41 +83,43 @@ export default function StaticPage({ products, lang, onUpdate, existingData, nex
     }
 
     try {
-      const newCode = Math.floor(100000 + Math.random() * 900000).toString();
-
-      setExpectedCode(newCode);
-      setVerificationStatus("sent");
-      setCode(new Array(6).fill(""));
-
-      console.log("Campaign ID:", campaignId);
-      console.log("Email:", formData.email);
-      console.log("Code:", newCode); // for debug
-
-      const response = await fetch("/api/webhook/email-verif", {
+      // Clear old messages and ensure we are in a clean state before sending
+      setErrorMessage("");
+      setSuccessMessage("");
+      
+      const response = await fetch("/api/webhook/semail-verif", {
         method: "POST",
         headers: {
           "Content-Type": "application/json"
         },
         body: JSON.stringify({
-          campaign_db_id: campaignId,
-          email: formData.email,
-          code: newCode
+          sec_id: campaignId,
+          email: formData.email
         })
       });
 
-      const data = await response.json(); // receive data from the response
+      const data = await response.json(); 
     
-      if (!response.ok) {
-        // If the server returned an error
-        console.error("Server error message:", data.message);
-        setErrorMessage(data.message); // Save the error message in state
-        setVerificationStatus("error");
+      // Evaluate new backend JSON structure
+      if (!response.ok || data.status === "error") {
+        let errorText = data.message || "Failed to send verification email.";
+        
+        // Target the specific duplicate code here
+        if (data.error?.code === "DUPLICATE_SUBMISSION") {
+            errorText = STATIC_UI.duplicate_email[lang];
+        } else if (data.error?.message) {
+            errorText = data.error.message;
+        }
+
+        setErrorMessage(errorText); 
+        setVerificationStatus("idle"); // Keep it idle so the code boxes do NOT show
         return;
       }
 
-      // Successful response
-      console.log("Success message:", data.message);
-      setSuccessMessage(data.message); // Save successful message
+      // Success Path
+      setVerificationStatus("sent");
+      setCode(new Array(6).fill(""));
+      setSuccessMessage(data.message || "Code sent successfully!"); 
 
       setTimeout(() => {
         if (inputRefs.current[0]) inputRefs.current[0].focus();
@@ -124,7 +127,8 @@ export default function StaticPage({ products, lang, onUpdate, existingData, nex
 
     } catch (err) {
       console.error("Failed to send verification email:", err);
-      setVerificationStatus("error");
+      setErrorMessage("Network error occurred while trying to send the code.");
+      setVerificationStatus("idle");
     }
   };
 
@@ -133,7 +137,10 @@ export default function StaticPage({ products, lang, onUpdate, existingData, nex
     const newCode = [...code];
     newCode[index] = element.value;
     setCode(newCode);
-    if (verificationStatus === "error") setVerificationStatus("sent");
+    
+    if (verificationStatus === "code_error") {
+      setVerificationStatus("sent");
+    }
 
     if (element.value !== "" && index < 5) {
       inputRefs.current[index + 1].focus();
@@ -146,7 +153,6 @@ export default function StaticPage({ products, lang, onUpdate, existingData, nex
     }
   };
 
-  // --- NEW PASTE LOGIC ---
   const handleCodePaste = (e) => {
     e.preventDefault();
     const pastedData = e.clipboardData.getData("text");
@@ -162,7 +168,9 @@ export default function StaticPage({ products, lang, onUpdate, existingData, nex
       }
       setCode(newCode);
       
-      if (verificationStatus === "error") setVerificationStatus("sent");
+      if (verificationStatus === "code_error") {
+        setVerificationStatus("sent");
+      }
 
       // Auto-focus the next logical empty box, or the last box if completely filled
       const focusIndex = Math.min(digits.length, 5);
@@ -172,16 +180,38 @@ export default function StaticPage({ products, lang, onUpdate, existingData, nex
     }
   };
 
-  const handleVerifyCode = () => {
-    if (code.join("") === expectedCode) {
-      setVerificationStatus("verified");
-      setFormData(prev => ({
-      ...prev,
-      email_verified: true   
-    }));
-      setErrors(prev => ({ ...prev, email: null }));
-    } else {
-      setVerificationStatus("error");
+  const handleVerifyCode = async () => {
+    try {
+      const enteredCode = Number(code.join(""));
+      
+      const response = await fetch("/api/webhook/semail-get-token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          email: formData.email,
+          code: enteredCode
+        })
+      });
+
+      const data = await response.json();
+
+      if (response.ok && data.submToken && data.status !== "error") {
+        setVerificationStatus("verified");
+        setErrorMessage("");
+        setFormData(prev => ({
+          ...prev,
+          email_verified: true,
+          submToken: data.submToken   
+        }));
+        setErrors(prev => ({ ...prev, email: null }));
+      } else {
+        setVerificationStatus("code_error"); // Specific error state for the code input boxes
+      }
+    } catch (err) {
+      console.error("Failed to verify code:", err);
+      setVerificationStatus("code_error");
     }
   };
 
@@ -331,7 +361,7 @@ export default function StaticPage({ products, lang, onUpdate, existingData, nex
           </p>
         )}
 
-        {(verificationStatus === "sent" || verificationStatus === "error") && (
+        {(verificationStatus === "sent" || verificationStatus === "code_error") && (
           <div style={{ 
             marginTop: "15px", padding: "15px", 
             backgroundColor: "var(--bg-body)", 
@@ -357,14 +387,14 @@ export default function StaticPage({ products, lang, onUpdate, existingData, nex
                   style={{
                     width: "36px", height: "45px", fontSize: "1.2rem", textAlign: "center",
                     borderRadius: "6px",
-                    border: `2px solid ${verificationStatus === "error" ? "#ff6b6b" : "var(--border-color)"}`,
+                    border: `2px solid ${verificationStatus === "code_error" ? "#ff6b6b" : "var(--border-color)"}`,
                     backgroundColor: "var(--bg-input)", color: "var(--text-main)", outline: "none"
                   }}
                 />
               ))}
             </div>
 
-            {verificationStatus === "error" && (
+            {verificationStatus === "code_error" && (
               <p style={{ color: "#ff6b6b", margin: "-5px 0 10px 0", fontSize: "0.85rem" }}>
                 {STATIC_UI.incorrect_code[lang]}
               </p>
